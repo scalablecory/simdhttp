@@ -1,4 +1,6 @@
-﻿using System;
+﻿using BenchmarkDotNet.Attributes;
+using BenchmarkDotNet.Running;
+using System;
 using System.Diagnostics;
 using System.Numerics;
 using System.Reflection.Metadata.Ecma335;
@@ -11,57 +13,170 @@ using System.Threading.Tasks;
 
 namespace simdhttp
 {
-    class Program
+    [RankColumn]
+    public class Program
     {
-        static void Main(string[] args)
-        {
-            byte[] buffer = Encoding.ASCII.GetBytes(
+        static byte[] s_buffer = Encoding.ASCII.GetBytes(
                 "HTTP/1.1 200 OK\r\n" +
                 "Content-Type: application/json\r\n" +
                 "Content-Length: foo\r\n" +
                 "\r\n"
                 );
 
-            ParseHttpAVX2(buffer, true, r =>
+        static Action<Range> nopAction = delegate { };
+
+        //[Benchmark]
+        //public void SSE2()
+        //{
+        //    ParseHttpSSE2(s_buffer, true, nopAction);
+        //}
+
+        //[Benchmark]
+        //public void SSE2_Try2()
+        //{
+        //    ParseHttpSSE2_Try2(s_buffer, true, nopAction);
+        //}
+
+        //[Benchmark]
+        //public void Portable()
+        //{
+        //    ParseHttpPortable(0, 0, s_buffer, true, nopAction);
+        //}
+
+        [Benchmark]
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+        public void New()
+        {
+            var reader = new HttpHeaderReader(s_buffer, true);
+
+            while (reader.TryParse())
             {
-                string line = Encoding.ASCII.GetString(buffer.AsSpan(r));
-                Console.WriteLine($"{r}: {line}");
-            });
+                // do nothing.
+            }
         }
 
-        static int ParseHttpAVX2(Span<byte> buffer, bool doneReading, Action<Range> onRange)
+        [Benchmark(Baseline = true)]
+        public void Original()
         {
-            var cr = Vector256.Create((byte)'\n');
+            ParseOriginal(s_buffer, true, nopAction);
+        }
 
-            ReadOnlySpan<Vector256<byte>> span = MemoryMarshal.Cast<byte, Vector256<byte>>(buffer);
+        static void Main(string[] args)
+        {
+            new Program().New();
+
+            if (false)
+            {
+                ParseHttpSSE2_Try2(s_buffer, true, r =>
+                {
+                    string s = Encoding.ASCII.GetString(s_buffer.AsSpan(r));
+                    Console.WriteLine($"{r} -> {s}");
+                });
+            }
+
+            if (false)
+            {
+                var reader = new HttpHeaderReader(s_buffer, true);
+
+                while (reader.TryParse())
+                {
+                    Range r = reader.Range;
+
+                    string s = Encoding.ASCII.GetString(s_buffer.AsSpan(r));
+                    Console.WriteLine($"{r} -> {s}");
+                }
+            }
+
+            if(false)
+            {
+                BenchmarkRunner.Run<Program>();
+            }
+        }
+
+        static int ParseHttpSSE2_Try2(Span<byte> buffer, bool doneReading, Action<Range> onRange)
+        {
+            var cr = Vector128.Create((byte)'\n');
+            int lineStart = 0;
+
+            ref byte firstByte = ref buffer[0];
+            int i = 0;
+            while ((buffer.Length - i) >= Vector128<byte>.Count)
+            {
+                Vector128<byte> x = Unsafe.As<byte, Vector128<byte>>(ref Unsafe.Add(ref firstByte, i));
+
+                // Each bit set indicates a LF.
+                Vector128<byte> isCr = Sse2.CompareEqual(x, cr);
+                uint mask = (uint)Sse2.MoveMask(isCr);
+
+                if (mask != 0)
+                {
+                    i += BitOperations.TrailingZeroCount(mask);
+
+                    // This code works for both LF and CRLF, for compatibility.
+                    int startIdx = i != 0 && buffer[i - 1] == '\r' ? i - 1 : i;
+
+                    int tabIdx = i + 1;
+                    if (tabIdx != buffer.Length)
+                    {
+                        byte ht = buffer[tabIdx];
+                        if (ht == ' ' || ht == '\t')
+                        {
+                            // Continuation line. Check that we're in a header value, not name.
+                            if (!buffer.Slice(lineStart, startIdx - lineStart).Contains((byte)':'))
+                            {
+                                throw new Exception();
+                            }
+
+                            // Replace CRLF with spaces and keep going.
+                            buffer[startIdx] = (byte)' ';
+                            buffer[i] = (byte)' ';
+                            continue;
+                        }
+                    }
+                    else if (!doneReading)
+                    {
+                        return lineStart;
+                    }
+
+                    // Found a line to return.
+                    onRange(new Range(lineStart, startIdx));
+                    lineStart = tabIdx;
+                    i = tabIdx;
+                }
+                else
+                {
+                    i += Vector128<byte>.Count;
+                }
+            }
+
+            return ParseHttpPortable(lineStart, i, buffer, doneReading, onRange);
+        }
+
+        static int ParseHttpSSE2(Span<byte> buffer, bool doneReading, Action<Range> onRange)
+        {
+            var cr = Vector128.Create((byte)'\n');
+
+            ReadOnlySpan<Vector128<byte>> span = MemoryMarshal.Cast<byte, Vector128<byte>>(buffer);
             int lineStart = 0;
 
             for (int i = 0; i < span.Length; ++i)
             {
-                Vector256<byte> x = span[i];
-                Vector256<byte> isCr = Avx2.CompareEqual(x, cr);
+                Vector128<byte> x = span[i];
 
-                if (Avx2.TestZ(isCr, isCr))
-                {
-                    continue;
-                }
+                // Each bit set indicates a LF.
+                Vector128<byte> isCr = Sse2.CompareEqual(x, cr);
+                uint mask = (uint)Sse2.MoveMask(isCr);
 
-                uint mask = (uint)Avx2.MoveMask(isCr);
-
-                do
+                while (mask != 0)
                 {
                     int maskIdx = BitOperations.TrailingZeroCount(mask);
-                    int bufferIdx = i * Vector256<byte>.Count + maskIdx;
+                    int bufferIdx = i * Vector128<byte>.Count + maskIdx;
 
                     // Clear this bit from mask so it won't be re-read on next loop.
                     mask &= ~(1u << maskIdx);
 
                     // This code works for both LF and CRLF, for compatibility.
-                    int startIdx = bufferIdx;
-                    if (bufferIdx != 0 && buffer[bufferIdx - 1] == '\r')
-                    {
-                        startIdx = bufferIdx - 1;
-                    }
+                    int startIdx = bufferIdx != 0 && buffer[bufferIdx - 1] == '\r' ? bufferIdx - 1 : bufferIdx;
 
                     int tabIdx = bufferIdx + 1;
                     if (tabIdx != buffer.Length)
@@ -69,7 +184,13 @@ namespace simdhttp
                         byte ht = buffer[tabIdx];
                         if (ht == ' ' || ht == '\t')
                         {
-                            // Continuation line. replace CRLF with SPSP and keep going.
+                            // Continuation line. Check that we're in a header value, not name.
+                            if (!buffer.Slice(lineStart, startIdx - lineStart).Contains((byte)':'))
+                            {
+                                throw new Exception();
+                            }
+
+                            // Replace CRLF with spaces and keep going.
                             buffer[startIdx] = (byte)' ';
                             buffer[bufferIdx] = (byte)' ';
                             continue;
@@ -84,24 +205,26 @@ namespace simdhttp
                     onRange(new Range(lineStart, startIdx));
                     lineStart = tabIdx;
                 }
-                while (mask != 0);
             }
 
-            return ParseHttpPortable(lineStart, span.Length * Vector256<byte>.Count, buffer, doneReading, onRange);
+            return ParseHttpPortable(lineStart, span.Length * Vector128<byte>.Count, buffer, doneReading, onRange);
         }
 
-        static int ParseHttpPortable(int lineStart, int parseFromIdx, Span<byte> buffer, bool doneReading, Action<Range> onRange)
+        static int ParseHttpPortable(int lineStart, int bufferIdx, Span<byte> buffer, bool doneReading, Action<Range> onRange)
         {
-            for (int bufferIdx = parseFromIdx; bufferIdx < buffer.Length; ++bufferIdx)
+            for (; bufferIdx < buffer.Length; ++bufferIdx)
             {
-                if (buffer[bufferIdx] != '\n') continue;
+                int nextIdx = buffer.Slice(bufferIdx).IndexOf((byte)'\n');
+
+                if (nextIdx < 0)
+                {
+                    break;
+                }
+
+                bufferIdx += nextIdx;
 
                 // This code works for both LF and CRLF, for compatibility.
-                int startIdx = bufferIdx;
-                if (bufferIdx != 0 && buffer[bufferIdx - 1] == '\r')
-                {
-                    startIdx = bufferIdx - 1;
-                }
+                int startIdx = bufferIdx != 0 && buffer[bufferIdx - 1] == '\r' ? bufferIdx - 1 : bufferIdx;
 
                 int tabIdx = bufferIdx + 1;
                 if (tabIdx != buffer.Length)
@@ -109,7 +232,13 @@ namespace simdhttp
                     byte ht = buffer[tabIdx];
                     if (ht == ' ' || ht == '\t')
                     {
-                        // Continuation line. replace CRLF with spaces and keep going.
+                        // Continuation line. Check that we're in a header value, not name.
+                        if (!buffer.Slice(lineStart, startIdx - lineStart).Contains((byte)':'))
+                        {
+                            throw new Exception();
+                        }
+
+                        // Replace CRLF with spaces and keep going.
                         buffer[startIdx] = (byte)' ';
                         buffer[bufferIdx] = (byte)' ';
                         continue;
@@ -126,6 +255,95 @@ namespace simdhttp
             }
 
             return lineStart;
+        }
+
+        static readonly Vector128<byte> linefeed = Vector128.Create((byte)'\n');
+
+        static void ParseOriginal(byte[] _readBuffer, bool foldedHeadersAllowed, Action<Range> onRange)
+        {
+            int _readOffset = 0, _readLength = _readBuffer.Length;
+
+            while (_readOffset != _readLength)
+            {
+                int previouslyScannedBytes = 0;
+                while (true)
+                {
+                    int scanOffset = _readOffset + previouslyScannedBytes;
+                    int lfIndex = Array.IndexOf(_readBuffer, (byte)'\n', scanOffset, _readLength - scanOffset);
+                    if (lfIndex >= 0)
+                    {
+                        int startIndex = _readOffset;
+                        int length = lfIndex - startIndex;
+                        if (lfIndex > 0 && _readBuffer[lfIndex - 1] == '\r')
+                        {
+                            length--;
+                        }
+
+                        // If this isn't the ending header, we need to account for the possibility
+                        // of folded headers, which per RFC2616 are headers split across multiple
+                        // lines, where the continuation line begins with a space or horizontal tab.
+                        // The feature was deprecated in RFC 7230 3.2.4, but some servers still use it.
+                        if (foldedHeadersAllowed && length > 0)
+                        {
+                            // If the newline is the last character we've buffered, we need at least
+                            // one more character in order to see whether it's space/tab, in which
+                            // case it's a folded header.
+                            if (lfIndex + 1 == _readLength)
+                            {
+                                // The LF is at the end of the buffer, so we need to read more
+                                // to determine whether there's a continuation.  We'll read
+                                // and then loop back around again, but to avoid needing to
+                                // rescan the whole header, reposition to one character before
+                                // the newline so that we'll find it quickly.
+                                int backPos = _readBuffer[lfIndex - 1] == '\r' ? lfIndex - 2 : lfIndex - 1;
+                                Debug.Assert(backPos >= 0);
+                                previouslyScannedBytes = backPos - _readOffset;
+                                continue;
+                            }
+
+                            // We have at least one more character we can look at.
+                            Debug.Assert(lfIndex + 1 < _readLength);
+                            char nextChar = (char)_readBuffer[lfIndex + 1];
+                            if (nextChar == ' ' || nextChar == '\t')
+                            {
+                                // The next header is a continuation.
+
+                                // Folded headers are only allowed within header field values, not within header field names,
+                                // so if we haven't seen a colon, this is invalid.
+                                if (Array.IndexOf(_readBuffer, (byte)':', _readOffset, lfIndex - _readOffset) == -1)
+                                {
+                                    throw new Exception();
+                                }
+
+                                // When we return the line, we need the interim newlines filtered out. According
+                                // to RFC 7230 3.2.4, a valid approach to dealing with them is to "replace each
+                                // received obs-fold with one or more SP octets prior to interpreting the field
+                                // value or forwarding the message downstream", so that's what we do.
+                                _readBuffer[lfIndex] = (byte)' ';
+                                if (_readBuffer[lfIndex - 1] == '\r')
+                                {
+                                    _readBuffer[lfIndex - 1] = (byte)' ';
+                                }
+
+                                // Update how much we've read, and simply go back to search for the next newline.
+                                previouslyScannedBytes = (lfIndex + 1 - _readOffset);
+                                continue;
+                            }
+
+                            // Not at the end of a header with a continuation.
+                        }
+
+                        // Advance read position past the LF
+                        _readOffset = lfIndex + 1;
+
+                        onRange(new Range(startIndex, startIndex + length));
+                        break;
+                    }
+
+                    // Couldn't find LF.  Read more. Note this may cause _readOffset to change.
+                    previouslyScannedBytes = _readLength - _readOffset;
+                }
+            }
         }
     }
 
@@ -232,44 +450,124 @@ namespace simdhttp
 
     ref struct HttpHeaderReader
     {
-        private static readonly Vector256<byte> cr = Vector256.Create((byte)'\n');
+        private static readonly Vector128<byte> s_lineFeed128 = Vector128.Create((byte)'\n');
 
-        private ReadOnlySpan<Vector256<byte>> _packed;
-        private int _packedIter;
-        private uint _packedMask;
+        private readonly Span<byte> _buffer;
+        private int _lineStart, _iter;
+        private readonly bool _doneReading;
 
-        private Span<byte> _buffer;
-        private int _lineStart;
+        public Range Range { get; private set; }
 
-        private bool TryParseAVX2(out Range range)
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public HttpHeaderReader(Span<byte> buffer, bool doneReading)
         {
-            if (_packedMask == 0)
-            {
-                while (++_packedIter < _packed.Length)
-                {
-                    Vector256<byte> x = _packed[_packedIter];
-                    Vector256<byte> isCr = Avx2.CompareEqual(x, cr);
-
-                    if (!Avx.TestZ(isCr, isCr))
-                    {
-                        _packedMask = (uint)Avx2.MoveMask(isCr);
-                        break;
-                    }
-                }
-
-                return TryParsePortable(out range);
-            }
-
-
-
-
-            return TryParsePortable(out range);
+            _buffer = buffer;
+            _lineStart = 0;
+            _iter = 0;
+            _doneReading = doneReading;
+            Range = default;
         }
 
-        private bool TryParsePortable(out Range range)
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        public bool TryParse()
         {
-            range = default;
+            if (Sse2.IsSupported)
+            {
+                return TryParseSSE2();
+            }
+
+            return TryParsePortable();
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+        private bool TryParseSSE2()
+        {
+            while (_buffer.Length - _iter >= Vector128<byte>.Count)
+            {
+                Vector128<byte> x = Unsafe.As<byte, Vector128<byte>>(ref _buffer[_iter]);
+
+                Vector128<byte> isLf = Sse2.CompareEqual(x, s_lineFeed128);
+                int mask = Sse2.MoveMask(isLf);
+
+                if (mask != 0)
+                {
+                    _iter += BitOperations.TrailingZeroCount(mask);
+
+                    bool? res = OnNewLine();
+                    if (res != null)
+                    {
+                        ++_iter;
+                        return res.GetValueOrDefault();
+                    }
+                }
+                else
+                {
+                    _iter += Vector128<byte>.Count;
+                    continue;
+                }
+            }
+
+            return TryParsePortable();
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+        private bool TryParsePortable()
+        {
+            for (; _iter != _buffer.Length; ++_iter)
+            {
+                int nextIdx = _buffer.Slice(_iter).IndexOf((byte)'\n');
+
+                if (nextIdx < 0)
+                {
+                    return false;
+                }
+
+                _iter += nextIdx;
+
+                bool? res = OnNewLine();
+                if (res != null)
+                {
+                    ++_iter;
+                    return res.GetValueOrDefault();
+                }
+            }
+
             return false;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private bool? OnNewLine()
+        {
+            // This code works for both LF and CRLF, for compatibility.
+            int startIdx = _iter != 0 && _buffer[_iter - 1] == '\r' ? _iter - 1 : _iter;
+
+            int tabIdx = _iter + 1;
+            if (tabIdx != _buffer.Length)
+            {
+                byte ht = _buffer[tabIdx];
+                if (ht == ' ' || ht == '\t')
+                {
+                    // Continuation line. Check that we're in a header value, not name.
+                    if (!_buffer.Slice(_lineStart, startIdx - _lineStart).Contains((byte)':'))
+                    {
+                        throw new Exception();
+                    }
+
+                    // Replace CRLF with spaces and keep going.
+                    _buffer[startIdx] = (byte)' ';
+                    _buffer[_iter] = (byte)' ';
+                    return null;
+                }
+            }
+            else if (!_doneReading)
+            {
+                return false;
+            }
+
+            // Found a line to return.
+            Range = new Range(_lineStart, startIdx);
+            _lineStart = tabIdx;
+            return true;
         }
     }
 }
